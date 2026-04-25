@@ -1,7 +1,7 @@
 {
 	"manifest_version": 1,
 	"name": "原琴·自动演奏",
-	"version": "0.1.2",
+	"version": "0.1.4",
 	"bgi_version": "0.59.1",
 	"description": "A simplified automatic Genshin Lyre based on AutoYuanQin by  提瓦特钓鱼玳师 & 半江残秋.",
 	"authors": [

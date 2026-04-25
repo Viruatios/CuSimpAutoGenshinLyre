@@ -1,4 +1,4 @@
-(async function () { // 待解决问题: 连音总时值如果为3个四分音符无法表示
+(async function () {
     const base_path = "assets/score_file/";
     const regex_name = /(?<=score_file\\)[\s\S]*?(?=.json)/;
     const PlayType = {
@@ -307,6 +307,9 @@
 
         async function unitPlay(unit, unitStartTime, gap) {
             const unitEndTime = unitStartTime + Math.round(unit.time * gap);
+            // 提前15毫秒抬键，制造物理间隙，防止原神等游戏引擎吞掉无缝衔接的同名按键
+            const keyUpTime = Math.max(unitStartTime + 10, unitEndTime - 15);
+
             if (unit.kind === "rest") {
                 await sleepUntil(unitEndTime);
                 return;
@@ -314,8 +317,9 @@
 
             if (unit.kind === "single") {
                 keyDown(unit.keys[0]);
-                await sleepUntil(unitEndTime);
+                await sleepUntil(keyUpTime);
                 keyUp(unit.keys[0]);
+                await sleepUntil(unitEndTime);
                 return;
             }
 
@@ -323,23 +327,30 @@
                 for (const key of unit.keys) {
                     keyDown(key);
                 }
-                await sleepUntil(unitEndTime);
+                await sleepUntil(keyUpTime);
                 for (const key of unit.keys) {
                     keyUp(key);
                 }
+                await sleepUntil(unitEndTime);
                 return;
             }
 
             if (unit.kind === "arpeggio") {
                 const n = unit.keys.length;
                 for (let i = 0; i < n; i++) {
-                    const key = unit.keys[i];
+                    const keyGroup = Array.isArray(unit.keys[i]) ? unit.keys[i] : [unit.keys[i]];
                     const noteStartTime = unitStartTime + Math.round((i / n) * unit.time * gap);
                     const noteEndTime = unitStartTime + Math.round(((i + 1) / n) * unit.time * gap);
+                    const noteReleaseTime = Math.max(noteStartTime + 10, noteEndTime - 15);
+
                     await sleepUntil(noteStartTime);
-                    keyDown(key);
-                    await sleepUntil(noteEndTime);
-                    keyUp(key);
+                    for (const key of keyGroup) {
+                        keyDown(key);
+                    }
+                    await sleepUntil(noteReleaseTime);
+                    for (const key of keyGroup) {
+                        keyUp(key);
+                    }
                 }
                 await sleepUntil(unitEndTime);
                 return;
@@ -418,28 +429,27 @@
                         continue; // 休止符
                     }
 
-                    if (unitStr.startsWith('(') && unitStr.endsWith(')')) {
-                        // 同时按下 (XYZ)
-                        const keys = toValidKeys(unitStr.slice(1, -1));
-                        if (keys.length === 0) {
-                            bar.push({ kind: "rest", keys: [], time: unitDuration });
-                        } else {
+                    // 使用正则提取基本单位内的原子（单词块(XXX)或单个字母X）
+                    const parts = unitStr.match(/\([A-Za-z]+\)|[A-Za-z]/g);
+                    if (!parts || parts.length === 0) {
+                        bar.push({ kind: "rest", keys: [], time: unitDuration });
+                        continue;
+                    }
+
+                    if (parts.length === 1) {
+                        const part = parts[0];
+                        const keys = toValidKeys(part);
+                        if (part.startsWith('(')) {
+                            // 同时按下 (XYZ)
                             bar.push({ kind: "chord", keys: keys, time: unitDuration });
+                        } else {
+                            // 单个按键
+                            bar.push({ kind: "single", keys: keys, time: unitDuration });
                         }
                     } else {
-                        const keys = toValidKeys(unitStr);
-                        if (keys.length === 0) {
-                            bar.push({ kind: "rest", keys: [], time: unitDuration });
-                            continue;
-                        }
-
-                        if (keys.length === 1) {
-                            // 单个按键
-                            bar.push({ kind: "single", keys: [keys[0]], time: unitDuration });
-                        } else {
-                            // 琶音按键
-                            bar.push({ kind: "arpeggio", keys: keys, time: unitDuration });
-                        }
+                        // 琶音按键，可能包含混合的单音或和弦
+                        const arpeggioKeys = parts.map(part => toValidKeys(part));
+                        bar.push({ kind: "arpeggio", keys: arpeggioKeys, time: unitDuration });
                     }
                 }
             }
