@@ -414,17 +414,20 @@
             const bar = [barLength]; // 第一项为小节里的总拍数
 
             for (let beatIdx = 0; beatIdx < beats.length; beatIdx++) {
-                const beatStr = beats[beatIdx].trim();
+                const beatStr = beats[beatIdx];
 
-                // 基本单位之间以“空格”分割
-                // 两个“空格”之间没有字母视作“休止符”，利用 split 产生空字符串 ""
-                const units = beatStr.split(' ');
+                // 谱序列通过“空格”和“/”进行划分。
+                // 排除位于“/”号前的空字串，将剩余的空字串视作“终止符”（休止符）
+                let processedBeatStr = beatStr.replace(/ +$/, '');
+                let units = processedBeatStr.split(' ');
+                units = units.map(u => u === "" ? "@" : u);
+
                 const unitDuration = 1 / units.length;
 
                 for (let unitIdx = 0; unitIdx < units.length; unitIdx++) {
                     const unitStr = units[unitIdx];
 
-                    if (unitStr === "") {
+                    if (unitStr === "@") {
                         bar.push({ kind: "rest", keys: [], time: unitDuration });
                         continue; // 休止符
                     }
