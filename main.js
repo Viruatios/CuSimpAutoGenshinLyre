@@ -556,11 +556,22 @@
                     });
                     file.writeTextSync(`${music_info.name}.json`, `${JSON.stringify(info)}`);
                 }
-                let denominator = 4;
+                // 计算每拍时长，默认以四分音符为基准。当遇到非四分音符基底的拍号时，自动进行修正以防止速度异常。
+                let gapMultiplier = 1;
                 if (music_info.time_signature && music_info.time_signature.includes('/')) {
-                    denominator = parseInt(music_info.time_signature.split('/')[1]) || 4;
+                    const [numStr, denStr] = music_info.time_signature.split('/');
+                    const num = parseInt(numStr) || 4;
+                    const den = parseInt(denStr) || 4;
+
+                    if (den === 8 && num % 3 === 0) {
+                        // 对于 6/8, 9/8 等复合拍子，通常以附点四分音符为一拍（即1.5个四分音符）
+                        gapMultiplier = 1.5;
+                    } else {
+                        // 其他情况按占四分音符的比例
+                        gapMultiplier = 4 / den;
+                    }
                 }
-                await listNotePlay(music_info.notes, (60000 / music_info.bpm) * (denominator / 4));
+                await listNotePlay(music_info.notes, (60000 / music_info.bpm) * gapMultiplier);
 
                 if (settings_msg.queueInterval > 0) await sleep(settings_msg.queueInterval * 1000);
             }
