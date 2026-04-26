@@ -110,10 +110,10 @@
     function get_settings() {
         const Settings = {
             startTime: 0,
-            playType: undefined,
+            playType: PlayType.SingleMusicOnce,
             musicQueue: [],
             queueInterval: 0,
-            repeatTimes: 1,
+            repeatTimes: 0,
             repeatInterval: 0,
             debug: false
         }
@@ -127,7 +127,20 @@
          * -> 1757485800000 (2025/9/10 14:30:00)的时间戳
          */
         const calTargetTimeStamp = (timeString) => {
-            const [hours, minutes, seconds] = timeString.replace(/[^0-9:]/g, "").split(':').map(Number);
+            if (typeof timeString !== "string") return 0;
+
+            const normalized = timeString.replace(/[^0-9:]/g, "").trim();
+            if (normalized === "") return 0;
+
+            const parts = normalized.split(':').map(Number);
+            if (parts.length < 2 || parts.length > 3 || parts.some(Number.isNaN)) {
+                throw new Error(`定时启动时间格式错误: ${timeString}`);
+            }
+
+            const [hours, minutes, seconds = 0] = parts;
+            if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59 || seconds < 0 || seconds > 59) {
+                throw new Error(`定时启动时间超出范围: ${timeString}`);
+            }
 
             const now = new Date();
             const year = now.getFullYear();
@@ -137,9 +150,18 @@
             const localDate = new Date(year, month, day, hours, minutes, seconds);
             return localDate.getTime();
         }
+
+        const parseNonNegativeInt = (value, defaultValue) => {
+            if (typeof value === "undefined" || value === null || `${value}`.trim() === "") {
+                return defaultValue;
+            }
+
+            const parsed = parseInt(value, 10);
+            return Number.isNaN(parsed) || parsed < 0 ? defaultValue : parsed;
+        };
         try {
             // 读取开始时间
-            let music_start = typeof (settings.music_start) === 'undefined' ? "00:00:00" : settings.music_start;
+            let music_start = typeof (settings.music_start) === 'undefined' ? "" : settings.music_start;
             Settings.startTime = calTargetTimeStamp(music_start);
             // 读取播放模式
             let type_select = typeof (settings.type_select) === 'undefined' ? "单曲单次执行" : settings.type_select;
@@ -161,33 +183,59 @@
                     break;
             }
 
+            const allMusic = musicList();
+
             // 读取队列间隔时间
-            Settings.queueInterval = (typeof (settings.music_interval) === 'undefined') ? (0) : parseInt(settings.music_interval, 10);
+            Settings.queueInterval = parseNonNegativeInt(settings.music_interval, 0);
             // 读取循环次数
-            Settings.repeatTimes = (typeof (settings.music_repeat) === 'undefined') ? (1) : parseInt(settings.music_repeat, 10);
+            Settings.repeatTimes = parseNonNegativeInt(settings.music_repeat, 0);
             // 读取循环间隔时间
-            Settings.repeatInterval = (typeof (settings.repeat_interval) === 'undefined') ? (0) : parseInt(settings.repeat_interval, 10);
+            Settings.repeatInterval = parseNonNegativeInt(settings.repeat_interval, 0);
             // 读取乐曲队列 Array[musicName]
             if (Settings.playType === PlayType.SingleMusicOnce || Settings.playType === PlayType.SingleMusicRepeat) {
-                Settings.musicQueue.push((typeof (settings.music_selector) === 'undefined') ? (undefined) : (settings.music_selector));
+                const selectedMusic = (typeof (settings.music_selector) === 'undefined') ? undefined : settings.music_selector;
+                if (typeof selectedMusic === "string" && allMusic.includes(selectedMusic)) {
+                    Settings.musicQueue.push(selectedMusic);
+                } else if (allMusic.length > 0) {
+                    Settings.musicQueue.push(allMusic[0]);
+                }
             }
             else {
-                let music_queue = (typeof (settings.music_queue) === 'undefined') ? (undefined) : (settings.music_queue);
-                if (music_queue === undefined) throw new Error("队列执行无序号");
-                let musicIndex = Array.from(new Set(music_queue.split(' ').filter(item => item !== ""))); // 去重
-                const allMusic = musicList();
-                musicIndex.forEach(indexStr => {
-                    const matchedMusic = allMusic.find(music => music.includes(indexStr));
-                    if (matchedMusic) {
-                        Settings.musicQueue.push(matchedMusic);
-                    }
-                });
+                const music_queue = (typeof (settings.music_queue) === 'undefined') ? "" : `${settings.music_queue}`;
+                const queueText = music_queue.trim();
+
+                // 队列留空时，默认按本地曲谱顺序全部播放
+                if (queueText === "") {
+                    Settings.musicQueue = [...allMusic];
+                } else {
+                    const musicIndex = Array.from(new Set(queueText.split(/\s+/).filter(item => item !== ""))); // 去重
+                    musicIndex.forEach(indexStr => {
+                        const normalizedIndex = parseInt(indexStr, 10);
+                        if (Number.isNaN(normalizedIndex) || normalizedIndex <= 0) return;
+                        const prefix = normalizedIndex.toString().padStart(4, '0');
+                        const matchedMusic = allMusic.find(music => music.startsWith(`${prefix}.`));
+                        if (matchedMusic) {
+                            Settings.musicQueue.push(matchedMusic);
+                        }
+                    });
+                }
+
+                if (Settings.musicQueue.length === 0 && allMusic.length > 0) {
+                    Settings.musicQueue = [...allMusic];
+                    log.warn("未匹配到有效队列序号，已自动切换为全部曲目播放");
+                }
             }
+
+            if (Settings.musicQueue.length === 0) {
+                throw new Error("本地曲谱为空，无法开始演奏");
+            }
+
             Settings.debug = (typeof (settings.debug) === 'undefined') ? (false) : (settings.debug === "启用");
             return Settings;
 
         } catch (error) {
             log.error(`读取JS脚本配置时出错：${error}`);
+            return Settings;
         }
     }
 
@@ -464,6 +512,7 @@
 
 
     async function waitTargetTime(targetTimeStamp) {
+        if (!Number.isFinite(targetTimeStamp) || targetTimeStamp <= 0) return;
         let now = new Date();
         if (now.getTime() >= targetTimeStamp) return;
         log.info(`等待至目标时间: ${new Date(targetTimeStamp).toLocaleString()}`);
@@ -471,6 +520,7 @@
             await sleep(targetTimeStamp - now.getTime() - 100);
         }
         while (Date.now() < targetTimeStamp) {
+            await sleep(5);
         }
         return;
     }
@@ -529,7 +579,6 @@
 
         let settings_msg = get_settings();
         DEBUG = settings_msg.debug;
-        console.log(`${settings_msg}`)
 
         const music_infos = [];
         for (const music_name of settings_msg.musicQueue) {
@@ -540,13 +589,21 @@
             }
             music_infos.push(music_info);
         }
+        if (music_infos.length === 0) {
+            log.error("无可演奏曲目，脚本结束");
+            return;
+        }
 
+        const isQueueMode = settings_msg.playType === PlayType.QueueMusicOnce || settings_msg.playType === PlayType.QueueMusicRepeat;
+        const isRepeatMode = settings_msg.playType === PlayType.SingleMusicRepeat || settings_msg.playType === PlayType.QueueMusicRepeat;
+        const alwaysRepeat = isRepeatMode && settings_msg.repeatTimes === 0;
+        let remainRounds = isRepeatMode ? Math.max(1, settings_msg.repeatTimes) : 1;
 
-        const alwaysRepeat = ((settings_msg.playType === PlayType.SingleMusicRepeat || settings_msg.playType === PlayType.QueueMusicRepeat) && (settings_msg.repeatTimes === 0));
         await waitTargetTime(settings_msg.startTime);
         // try {
         do {
-            for (const music_info of music_infos) {
+            for (let i = 0; i < music_infos.length; i++) {
+                const music_info = music_infos[i];
                 log.info(`开始演奏: ${music_info.name} - ${music_info.author}`);
                 if (DEBUG) {
                     log.info(`乐曲已打印至${music_info.name}.json`);
@@ -573,10 +630,19 @@
                 }
                 await listNotePlay(music_info.notes, (60000 / music_info.bpm) * gapMultiplier);
 
-                if (settings_msg.queueInterval > 0) await sleep(settings_msg.queueInterval * 1000);
+                if (isQueueMode && settings_msg.queueInterval > 0 && i < music_infos.length - 1) {
+                    await sleep(settings_msg.queueInterval * 1000);
+                }
             }
-            if (settings_msg.repeatInterval > 0) await sleep(settings_msg.repeatInterval * 1000);
-        } while (alwaysRepeat || --settings_msg.repeatTimes > 0);
+
+            if (!alwaysRepeat) {
+                remainRounds--;
+            }
+
+            if (isRepeatMode && settings_msg.repeatInterval > 0 && (alwaysRepeat || remainRounds > 0)) {
+                await sleep(settings_msg.repeatInterval * 1000);
+            }
+        } while (alwaysRepeat || remainRounds > 0);
         // } catch (error) {
         //     if (DEBUG) {
         //         log.error(`脚本执行错误 ${error} erron.txt 已打印`)
