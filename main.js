@@ -556,7 +556,11 @@
                     });
                     file.writeTextSync(`${music_info.name}.json`, `${JSON.stringify(info)}`);
                 }
-                await listNotePlay(music_info.notes, (60000 / music_info.bpm));
+                let denominator = 4;
+                if (music_info.time_signature && music_info.time_signature.includes('/')) {
+                    denominator = parseInt(music_info.time_signature.split('/')[1]) || 4;
+                }
+                await listNotePlay(music_info.notes, (60000 / music_info.bpm) * (denominator / 4));
 
                 if (settings_msg.queueInterval > 0) await sleep(settings_msg.queueInterval * 1000);
             }
