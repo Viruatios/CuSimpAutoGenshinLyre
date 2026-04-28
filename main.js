@@ -346,6 +346,11 @@
      * @property {Unit[]} units 一个小节中所有基本单位
      */
     async function listNotePlay(bar_list, gap) {
+        // 维护一张物理层面的按键状态机记录每一个键的最新“上一次松开时间”
+        const keyState = {};
+        // 最小间隔时间 25ms
+        const MIN_GAP_TIME = 25;
+
         async function sleepUntil(targetTime) {
             const remain = targetTime - Date.now();
             if (remain > 0) {
@@ -353,10 +358,29 @@
             }
         }
 
+        // 封装为独立的脉冲式短触按键动作函数
+        async function emitKeyPulse(key, targetHalfTime) {
+            const now = Date.now();
+            const lastUp = keyState[key] || 0;
+
+            // 判断如果 Now - Last_KeyUp_Time < MIN_GAP_TIME，强制补偿延时阻断
+            const timeSinceLastUp = now - lastUp;
+            if (timeSinceLastUp < MIN_GAP_TIME) {
+                await sleepUntil(lastUp + MIN_GAP_TIME);
+            }
+
+            keyDown(key);
+
+            // 动态计算按键持续时长，并作为脉冲式按键信号执行
+            const holdTime = Math.min(MIN_GAP_TIME, targetHalfTime);
+            await sleep(Math.max(1, Math.round(holdTime))); // 确保最少有1ms以防为0或负数
+
+            keyUp(key);
+            keyState[key] = Date.now();
+        }
+
         async function unitPlay(unit, unitStartTime, gap) {
             const unitEndTime = unitStartTime + Math.round(unit.time * gap);
-            // 提前15毫秒抬键，制造物理间隙，防止原神等游戏引擎吞掉无缝衔接的同名按键
-            const keyUpTime = Math.max(unitStartTime + 10, unitEndTime - 15);
 
             if (unit.kind === "rest") {
                 await sleepUntil(unitEndTime);
@@ -364,21 +388,15 @@
             }
 
             if (unit.kind === "single") {
-                keyDown(unit.keys[0]);
-                await sleepUntil(keyUpTime);
-                keyUp(unit.keys[0]);
+                const targetHalfTime = unit.time * gap * 0.5;
+                await emitKeyPulse(unit.keys[0], targetHalfTime);
                 await sleepUntil(unitEndTime);
                 return;
             }
 
             if (unit.kind === "chord") {
-                for (const key of unit.keys) {
-                    keyDown(key);
-                }
-                await sleepUntil(keyUpTime);
-                for (const key of unit.keys) {
-                    keyUp(key);
-                }
+                const targetHalfTime = unit.time * gap * 0.5;
+                await Promise.all(unit.keys.map(key => emitKeyPulse(key, targetHalfTime)));
                 await sleepUntil(unitEndTime);
                 return;
             }
@@ -388,17 +406,10 @@
                 for (let i = 0; i < n; i++) {
                     const keyGroup = Array.isArray(unit.keys[i]) ? unit.keys[i] : [unit.keys[i]];
                     const noteStartTime = unitStartTime + Math.round((i / n) * unit.time * gap);
-                    const noteEndTime = unitStartTime + Math.round(((i + 1) / n) * unit.time * gap);
-                    const noteReleaseTime = Math.max(noteStartTime + 10, noteEndTime - 15);
+                    const stepHalfTime = (unit.time * gap / n) * 0.5;
 
                     await sleepUntil(noteStartTime);
-                    for (const key of keyGroup) {
-                        keyDown(key);
-                    }
-                    await sleepUntil(noteReleaseTime);
-                    for (const key of keyGroup) {
-                        keyUp(key);
-                    }
+                    await Promise.all(keyGroup.map(key => emitKeyPulse(key, stepHalfTime)));
                 }
                 await sleepUntil(unitEndTime);
                 return;
@@ -498,7 +509,7 @@
                             bar.push({ kind: "single", keys: keys, time: unitDuration });
                         }
                     } else {
-                        // 琶音按键，可能包含混合的单音或和弦
+                        // 连续按键，可能包含混合的单音或和弦
                         const arpeggioKeys = parts.map(part => toValidKeys(part));
                         bar.push({ kind: "arpeggio", keys: arpeggioKeys, time: unitDuration });
                     }
