@@ -61,6 +61,8 @@
 
 # 更新日志
 
+放置备查：[BetterGI 开发文档](https://www.bettergi.com/dev/js/create.html)
+
 ## v0.1.x 主要改动：读谱规则极度简化。以及播放调度模型的修改。
 
 ### v0.1.0 修改后的读谱规则
@@ -197,6 +199,15 @@
 - 动态调节与脉冲式发音：原逻辑是占满音符的绝大部分时长执行按压，现已改为执行一个计算出的简短按下过程 const holdTime = Math.min(MIN_GAP_TIME, targetHalfTime) 配合短暂延时后直接抬起。这相当于我们只用脉冲向游戏传达信号，剩余所有的 await sleepUntil(unitEndTime) 区间都是安全的物理抬起状态（空窗期最大化）。
 - 并发触发和弦：利用 Promise.all 并发处理多按键（Chord、Arpeggio 分组），使得和弦音更加同时触发且各自走自己独立的防重叠校验逻辑。
 
-#### v0.1.9b 支持通过后台消息演奏
+#### v0.1.9b 支持后台演奏
 
-- 在 listNotePlay 函数内创建了一个实例 postMessage = new PostMessage()，并将原先直接调用的 keyDown(key) 和 keyUp(key) 替换为 postMessage.keyDown(key) 和 postMessage.keyUp(key)，以支持通过后台消息的方式来触发按键事件。
+- 在 listNotePlay 函数内创建了一个后台消息实例 postMessage = new PostMessage()，并将原先直接调用的 keyDown(key) 和 keyUp(key) 替换为 postMessage.keyDown(key) 和 postMessage.keyUp(key)，以支持通过后台消息的方式来触发按键事件。
+- 现在游戏内演奏不必总是保持游戏前台了。
+
+### v0.1.10 性能优化
+
+- 高精度时间源：引入了容错包装的 const getNow = () => typeof performance !== 'undefined' ? performance.now() : Date.now(); 自动调用受支持的最高精度时间打点源。如支持，则使用 performance.now() 提供亚毫秒级的时间精度，显著降低时间计算误差，提升长时间演奏的节拍稳定性。
+- 逻辑全预存计算（AOT）：将以往在弹奏时实时计算的“延时等待、防防吞音补偿、动态时差”全部用模拟时钟 currentSimTime 前置到了弹奏前的预处理阶段。通过计算推演生成一个巨大的原始打点 timeline 数组，从而保证弹奏时不再产生动态的状态计算开销。
+- 事件的时间序列化与无伤规避：对生成的离散 timeline 数组进行多重规则重排（先抓时间向先后顺序；遇到同时到达的目标，保证 Up（抬起）永远先由于 Down（按下）被触发）。
+- 事件扁平化与聚合：将时间点完全相同且动作行为一致的方法，例如某个和弦引发的多个瞬间 keyDown 操作合并在一起，原本会同时生成4个sleep对象，现在扁平化为了一个对象：[[{ time: 150, action: "down", keys: ["W", "E"] }]]。
+- 单必定时间轴扫描播放器：移除了所有的 async function sleepUntil、unitPlay 等拆分状态机，运行时只剩单纯的一个微任务循环去扫描合并时间事件序列数组。现在只需挂起一次 await sleep 然后直接并发派发所有按键指令，真正实现了毫无时间差计算和异步协程切分损耗的纯粹性能级回放。

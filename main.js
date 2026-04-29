@@ -325,97 +325,134 @@
     async function listNotePlay(bar_list, gap) {
         // 支持通过后台消息演奏
         const postMessage = new PostMessage();
-        // 维护一张物理层面的按键状态机记录每一个键的最新“上一次松开时间”
+
+        // 如果允许，使用 performance.now() 提供高精度时间；否则用 Date.now()（兼容性处理）
+        const getNow = () => typeof performance !== 'undefined' ? performance.now() : Date.now();
+
+        // 1. 预处理（Pre-bake）阶段：构建按键时间轴
         const keyState = {};
         // 最小间隔时间 25ms
         const MIN_GAP_TIME = 25;
+        const timeline = [];
 
-        async function sleepUntil(targetTime) {
-            const remain = targetTime - Date.now();
-            if (remain > 0) {
-                await sleep(remain);
-            }
-        }
-
-        // 封装为独立的脉冲式短触按键动作函数
-        async function emitKeyPulse(key, targetHalfTime) {
-            const now = Date.now();
+        // 计算脉冲式短触按键动作，将其注册到时间轴上，并更新物理状态机以供后续动作参考
+        function addKeyPulse(key, targetHalfTime, simTime) {
             const lastUp = keyState[key] || 0;
+            let actualDownTime = simTime;
 
-            // 判断如果 Now - Last_KeyUp_Time < MIN_GAP_TIME，强制补偿延时阻断
-            const timeSinceLastUp = now - lastUp;
+            // 判断是否需要延时阻塞，如果上次抬起时间距离当前模拟时间不足最小间隔，则推迟按下时间以保证间隔
+            const timeSinceLastUp = actualDownTime - lastUp;
             if (timeSinceLastUp < MIN_GAP_TIME) {
-                await sleepUntil(lastUp + MIN_GAP_TIME);
+                actualDownTime = lastUp + MIN_GAP_TIME;
             }
 
-            postMessage.keyDown(key);
+            // 动态计算脉冲时长，确保最少有1ms以防为0或负数
+            let holdTime = Math.min(MIN_GAP_TIME, targetHalfTime);
+            holdTime = Math.max(1, Math.round(holdTime));
 
-            // 动态计算按键持续时长，并作为脉冲式按键信号执行
-            const holdTime = Math.min(MIN_GAP_TIME, targetHalfTime);
-            await sleep(Math.max(1, Math.round(holdTime))); // 确保最少有1ms以防为0或负数
+            const actualUpTime = actualDownTime + holdTime;
 
-            postMessage.keyUp(key);
-            keyState[key] = Date.now();
+            // 在事件调度表上注册成对的下压和抬起动作
+            timeline.push({ time: actualDownTime, action: "down", key: key });
+            timeline.push({ time: actualUpTime, action: "up", key: key });
+
+            // 更新物理状态机
+            keyState[key] = actualUpTime;
         }
 
-        async function unitPlay(unit, unitStartTime, gap) {
-            const unitEndTime = unitStartTime + Math.round(unit.time * gap);
+        // 对所有音符执行虚拟模拟打点，结果注册到时间轴
+        let currentSimTime = 0;
+        let totalCalculatedTime = 0;
 
-            if (unit.kind === "rest") {
-                await sleepUntil(unitEndTime);
-                return;
-            }
-
-            if (unit.kind === "single") {
-                const targetHalfTime = unit.time * gap * 0.5;
-                await emitKeyPulse(unit.keys[0], targetHalfTime);
-                await sleepUntil(unitEndTime);
-                return;
-            }
-
-            if (unit.kind === "chord") {
-                const targetHalfTime = unit.time * gap * 0.5;
-                await Promise.all(unit.keys.map(key => emitKeyPulse(key, targetHalfTime)));
-                await sleepUntil(unitEndTime);
-                return;
-            }
-
-            if (unit.kind === "arpeggio") {
-                const n = unit.keys.length;
-                for (let i = 0; i < n; i++) {
-                    const keyGroup = Array.isArray(unit.keys[i]) ? unit.keys[i] : [unit.keys[i]];
-                    const noteStartTime = unitStartTime + Math.round((i / n) * unit.time * gap);
-                    const stepHalfTime = (unit.time * gap / n) * 0.5;
-
-                    await sleepUntil(noteStartTime);
-                    await Promise.all(keyGroup.map(key => emitKeyPulse(key, stepHalfTime)));
-                }
-                await sleepUntil(unitEndTime);
-                return;
-            }
-
-            await sleepUntil(unitEndTime);
-        }
-        log.info(`总计 ${bar_list.length} 小节, 预计演奏时长 ${(bar_list.length * gap * bar_list[0][0] / 1000).toFixed(2)}秒`);
         for (let i = 0; i < bar_list.length; i++) {
+            // 以下变量分别代表：当前小节的总拍数、基本单位列表，以及当前小节内已处理的拍数（用于计算每个基本单位的起始时间）
             let bar = bar_list[i];
             let barTime = bar[0];
             let units = bar.slice(1);
-            const barStartTime = Date.now();
             let elapsedBeat = 0;
+
             for (let j = 0; j < units.length; j++) {
                 let unit = units[j];
-                const unitStartTime = barStartTime + Math.round(elapsedBeat * gap);
-                await sleepUntil(unitStartTime);
-                await unitPlay(unit, unitStartTime, gap);
+                const unitStartTime = currentSimTime + Math.round(elapsedBeat * gap);
+
+                if (unit.kind === "single") {
+                    // 单音符
+                    const targetHalfTime = unit.time * gap * 0.5;
+                    addKeyPulse(unit.keys[0], targetHalfTime, unitStartTime);
+                }
+                else if (unit.kind === "chord") {
+                    // 和弦
+                    const targetHalfTime = unit.time * gap * 0.5;
+                    unit.keys.forEach(key => addKeyPulse(key, targetHalfTime, unitStartTime));
+                }
+                else if (unit.kind === "arpeggio") {
+                    // 琶音
+                    const n = unit.keys.length;
+
+                    // 琶音特殊的规则：视为单音符和和弦的组合，每个基本单位都被平均分配到该基本单位的时间片上，并且按照顺序依次触发
+                    for (let k = 0; k < n; k++) {
+                        const keyGroup = Array.isArray(unit.keys[k]) ? unit.keys[k] : [unit.keys[k]];
+                        const noteStartTime = unitStartTime + Math.round((k / n) * unit.time * gap);
+                        const stepHalfTime = (unit.time * gap / n) * 0.5;
+                        keyGroup.forEach(key => addKeyPulse(key, stepHalfTime, noteStartTime));
+                    }
+                }
                 elapsedBeat += unit.time;
             }
-            if (DEBUG) {
-                log.info(`${i} / ${bar_list.length} ${(i / bar_list.length * 100).toFixed(2)}%`)
-            }
-            await sleepUntil(barStartTime + Math.round(barTime * gap)); // 对齐至小节结束
+            // 对齐至小节结束时间
+            currentSimTime += Math.round(barTime * gap);
+            totalCalculatedTime = currentSimTime;
         }
-        await sleep(Math.round(gap * 8)); // 额外等待
+
+        // 2. 扁平化合并同时刻、同动作的事件
+        timeline.sort((a, b) => {
+            // 时间先后排序
+            if (a.time !== b.time) return a.time - b.time;
+            // 同一时间先处理抬起(up)，再处理按下(down)，避免同键冲突
+            if (a.action !== b.action) return a.action === "up" ? -1 : 1;
+            return 0;
+        });
+
+        const mergedTimeline = [];
+        for (const ev of timeline) {
+            if (mergedTimeline.length > 0) {
+                let last = mergedTimeline[mergedTimeline.length - 1];
+                if (last.time === ev.time && last.action === ev.action) {
+                    last.keys.push(ev.key); // 同步合并
+                    continue;
+                }
+            }
+            mergedTimeline.push({ time: ev.time, action: ev.action, keys: [ev.key] });
+        }
+
+        log.info(`总计 ${bar_list.length} 小节，解析完成：聚合为 ${mergedTimeline.length} 批次按键动作。预计总演奏时长 ${((totalCalculatedTime + gap * 8) / 1000).toFixed(2)} 秒`);
+
+
+        // 3. 启动 运行时 时间轴扫描 播放器
+        log.info(`开始演奏...`);
+
+        const playStartTime = getNow();
+
+        for (const ev of mergedTimeline) {
+            const targetTime = playStartTime + ev.time;
+            const remain = targetTime - getNow();
+            if (remain > 0) {
+                await sleep(remain);
+            }
+
+            // 执行聚合后的按键组指令
+            if (ev.action === "down") {
+                ev.keys.forEach(k => postMessage.keyDown(k));
+            } else {
+                ev.keys.forEach(k => postMessage.keyUp(k));
+            }
+        }
+
+        // 结尾保护等待，确保最后一个按键动作有足够时间被执行，避免过早结束脚本导致按键未能正确抬起
+        const finalRemain = (playStartTime + totalCalculatedTime + Math.round(gap * 8)) - getNow();
+        if (finalRemain > 0) {
+            await sleep(finalRemain);
+        }
     }
 
     /**
@@ -594,7 +631,7 @@
         do {
             for (let i = 0; i < music_infos.length; i++) {
                 const music_info = music_infos[i];
-                log.info(`开始演奏: ${music_info.name} - ${music_info.author}`);
+                log.info(`准备演奏: ${music_info.name} - ${music_info.author}`);
                 if (DEBUG) {
                     log.info(`乐曲已打印至${music_info.name}.json`);
                     let info = [];
