@@ -1,3 +1,5 @@
+/// <reference path="bettergi.d.ts" />
+
 (async function () {
     const base_path = "assets/score_file/";
     const regex_name = /(?<=score_file\\)[\s\S]*?(?=.json)/;
@@ -312,31 +314,6 @@
     }
 
     /**
-     *
-     * 执行单音
-     *
-     * @param key {string}
-     *
-     */
-    async function play_note(key) {
-        keyDown(key);
-        keyUp(key);
-    }
-
-    /**
-     *
-     * 执行和弦
-     *
-     * @param keys {Array.string}
-     *
-     */
-    async function play_chord(keys) {
-        for (const key of keys) {
-            play_note(key);
-        }
-    }
-
-    /**
      * 音符小节序列演奏（按基本单位串行驱动）
      * @typedef {{kind:string,keys:string[],time:number}} Unit
      * @typedef {[Number,...Unit[]]} Bar
@@ -346,6 +323,8 @@
      * @property {Unit[]} units 一个小节中所有基本单位
      */
     async function listNotePlay(bar_list, gap) {
+        // 支持通过后台消息演奏
+        const postMessage = new PostMessage();
         // 维护一张物理层面的按键状态机记录每一个键的最新“上一次松开时间”
         const keyState = {};
         // 最小间隔时间 25ms
@@ -369,13 +348,13 @@
                 await sleepUntil(lastUp + MIN_GAP_TIME);
             }
 
-            keyDown(key);
+            postMessage.keyDown(key);
 
             // 动态计算按键持续时长，并作为脉冲式按键信号执行
             const holdTime = Math.min(MIN_GAP_TIME, targetHalfTime);
             await sleep(Math.max(1, Math.round(holdTime))); // 确保最少有1ms以防为0或负数
 
-            keyUp(key);
+            postMessage.keyUp(key);
             keyState[key] = Date.now();
         }
 

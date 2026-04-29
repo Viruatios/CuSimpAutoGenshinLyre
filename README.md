@@ -196,3 +196,7 @@
 - 独立的按键执行发射器 emitKeyPulse(key, targetHalfTime)：将繁琐的 keyDown(key) 后跟随计算时间的逻辑完全抽离封装了起来。
 - 动态调节与脉冲式发音：原逻辑是占满音符的绝大部分时长执行按压，现已改为执行一个计算出的简短按下过程 const holdTime = Math.min(MIN_GAP_TIME, targetHalfTime) 配合短暂延时后直接抬起。这相当于我们只用脉冲向游戏传达信号，剩余所有的 await sleepUntil(unitEndTime) 区间都是安全的物理抬起状态（空窗期最大化）。
 - 并发触发和弦：利用 Promise.all 并发处理多按键（Chord、Arpeggio 分组），使得和弦音更加同时触发且各自走自己独立的防重叠校验逻辑。
+
+#### v0.1.9b 支持通过后台消息演奏
+
+- 在 listNotePlay 函数内创建了一个实例 postMessage = new PostMessage()，并将原先直接调用的 keyDown(key) 和 keyUp(key) 替换为 postMessage.keyDown(key) 和 postMessage.keyUp(key)，以支持通过后台消息的方式来触发按键事件。
