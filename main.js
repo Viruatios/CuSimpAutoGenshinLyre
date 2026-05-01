@@ -2,6 +2,7 @@
 
 (async function () {
     const base_path = "assets/score_file/";
+    const cache_path = "assets/cache/";
     const regex_name = /(?<=score_file\\)[\s\S]*?(?=.json)/;
     const PlayType = {
         SingleMusicOnce: 0, // 单曲单次执行
@@ -13,15 +14,89 @@
     /**
      * -------- 工具函数 --------
      */
-    // /**
-    //  *
-    //  * @returns {Array} 本地曲谱文件列表
-    //  */
-    // const musicList = () => {
-    //     const scoreFiles = Array.from(file.readPathSync(base_path)).filter(path => !file.isFolder(path) && path.endsWith(".json"));
-    //     const localMusicList = scoreFiles.map(path => path.match(regex_name)[0]);
-    //     return localMusicList;
-    // }
+
+    function ensureCacheDir() {
+        try {
+            if (!file.isFolder(cache_path)) {
+                if (typeof System !== 'undefined' && System.IO && System.IO.Directory) {
+                    System.IO.Directory.CreateDirectory(cache_path);
+                }
+            }
+        } catch (e) {
+            log.error(`创建缓存目录失败: ${e}`);
+        }
+    }
+
+    /**
+     * 获取文件修改时间 (返回时间戳)
+     */
+    function getFileModTime(path) {
+        try {
+            if (typeof System !== 'undefined' && System.IO && System.IO.File) {
+                const dt = System.IO.File.GetLastWriteTimeUtc(path);
+                return new Date(dt.Year, dt.Month - 1, dt.Day, dt.Hour, dt.Minute, dt.Second, dt.Millisecond).getTime();
+            }
+        } catch (e) { }
+        return 0; // 无法获取时默认返回0
+    }
+
+    /**
+     * 删除文件
+     */
+    function deleteFile(path) {
+        try {
+            if (typeof System !== 'undefined' && System.IO && System.IO.File) {
+                System.IO.File.Delete(path);
+            }
+        } catch (e) { }
+    }
+
+    /**
+     * 启动时检查清理过期缓存
+     */
+    function checkAndCleanCache(allMusicList) {
+        ensureCacheDir();
+        try {
+            if (!file.isFolder(cache_path)) return;
+            const cacheEntries = Array.from(file.readPathSync(cache_path));
+            const jsonCaches = cacheEntries.filter(entry => !file.isFolder(entry) && entry.endsWith('.json'));
+
+            const musicSet = new Set(allMusicList);
+
+            jsonCaches.forEach(entry => {
+                const fileName = entry.split(/[/\\]/).pop();
+                const musicName = fileName.replace(/\.json$/, '');
+                const scoreFile = pathJoin(musicName);
+
+                try {
+                    // 若原曲目不存在则删除
+                    if (!musicSet.has(musicName)) {
+                        deleteFile(entry);
+                        log.debug(`缓存对应的曲谱不存在，已删除过期缓存: ${fileName}`);
+                        return;
+                    }
+
+                    const cacheText = file.readTextSync(entry);
+                    if (!cacheText) {
+                        deleteFile(entry);
+                        return;
+                    }
+                    const cacheData = JSON.parse(cacheText);
+                    const modTime = getFileModTime(scoreFile);
+
+                    // 创建时间早于曲谱修改时间，或无创建时间，则删除
+                    if (!cacheData.create_time || (modTime > 0 && cacheData.create_time < modTime)) {
+                        deleteFile(entry);
+                        log.debug(`曲谱已修改，已删除过期缓存: ${fileName}`);
+                    }
+                } catch (err) {
+                    deleteFile(entry);
+                }
+            });
+        } catch (error) {
+            log.error(`检查缓存时出错: ${error}`);
+        }
+    }
 
     /**
      * 读取本地曲谱文件夹下的所有 .json 文件，并返回文件名列表。
@@ -109,7 +184,7 @@
      * @property {Boolean} debug - 是否启用调试模式
      *
      */
-    function get_settings() {
+    function get_settings(allMusic) {
         const Settings = {
             startTime: 0,
             playType: PlayType.SingleMusicOnce,
@@ -184,8 +259,6 @@
                     Settings.playType = PlayType.SingleMusicOnce;
                     break;
             }
-
-            const allMusic = musicList();
 
             // 读取队列间隔时间
             Settings.queueInterval = parseNonNegativeInt(settings.music_interval, 0);
@@ -314,22 +387,90 @@
     }
 
     /**
-     * 音符小节序列演奏（按基本单位串行驱动）
-     * @typedef {{kind:string,keys:string[],time:number}} Unit
-     * @typedef {[Number,...Unit[]]} Bar
-     * @param {Bar[]} bar_list
-     * @param {Number} gap 一拍的时长,单位ms
-     * @property {Number} barTime 小节时长
-     * @property {Unit[]} units 一个小节中所有基本单位
+     * 将乐谱键位字符串序列化为按小节分组的基本单位数组
+     * 
+     * @param {string} stringSheet - 待序列化的键位乐谱字符串
+     * @returns {Array<Array<number|Object>>} - 小节数组
      */
-    async function listNotePlay(bar_list, gap) {
-        // 支持通过后台消息演奏
-        const postMessage = new PostMessage();
+    function keySheetSerialization(stringSheet) {
+        const result = [];
+        const toValidKeys = (text) => {
+            return text.toUpperCase().match(/[A-Z]/g) || [];
+        };
 
-        // 如果允许，使用 performance.now() 提供高精度时间；否则用 Date.now()（兼容性处理）
-        const getNow = () => typeof performance !== 'undefined' ? performance.now() : Date.now();
+        // 单行之中的按键视作一小节
+        const lines = stringSheet.split('\n');
 
-        // 1. 预处理（Pre-bake）阶段：构建按键时间轴
+        for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+            let line = lines[lineIdx].replace(/\r/g, "");
+            if (line.trim().length === 0) continue; // 忽略空行
+
+            // 处理相邻的 /，不生成休止符
+            line = line.replace(/\/{2,}/g, "/");
+
+            const beats = line.split('/');
+            const barLength = beats.length;
+            const bar = [barLength]; // 第一项为小节里的总拍数
+
+            for (let beatIdx = 0; beatIdx < beats.length; beatIdx++) {
+                const beatStr = beats[beatIdx];
+
+                let processedBeatStr = beatStr.trimEnd();
+                if (processedBeatStr === "" && beatIdx === beats.length - 1) continue;
+
+                let units = processedBeatStr.split(' ');
+                units = units.map(u => u === "" ? "@" : u);
+
+                const unitDuration = 1 / units.length;
+
+                for (let unitIdx = 0; unitIdx < units.length; unitIdx++) {
+                    const unitStr = units[unitIdx];
+
+                    if (unitStr === "@") {
+                        bar.push({ kind: "rest", keys: [], time: unitDuration });
+                        continue; // 休止符
+                    }
+
+                    // 使用正则提取基本单位内的原子（单词块(XXX)或单个字母X）
+                    const parts = unitStr.match(/\([A-Za-z]+\)|[A-Za-z]/g);
+                    if (!parts || parts.length === 0) {
+                        bar.push({ kind: "rest", keys: [], time: unitDuration });
+                        continue;
+                    }
+
+                    if (parts.length === 1) {
+                        const part = parts[0];
+                        const keys = toValidKeys(part);
+                        if (part.startsWith('(')) {
+                            // 同时按下 (XYZ)
+                            bar.push({ kind: "chord", keys: keys, time: unitDuration });
+                        } else {
+                            // 单个按键
+                            bar.push({ kind: "single", keys: keys, time: unitDuration });
+                        }
+                    } else {
+                        // 连续按键，可能包含混合的单音或和弦
+                        const arpeggioKeys = parts.map(part => toValidKeys(part));
+                        bar.push({ kind: "arpeggio", keys: arpeggioKeys, time: unitDuration });
+                    }
+                }
+            }
+            if (bar.length > 1 || barLength > 0) result.push(bar);
+        }
+
+        return result;
+    }
+
+    // 生成缓存文件：构建按键时间轴，然后合并简化
+
+    /**
+     * @param {Bar[]} bar_list 乐谱小节数组
+     * @param {Number} gap 一拍的时长，单位ms
+     * @returns {Object} 包含 mergedTimeline 和 totalCalculatedTime
+     */
+
+    // 1. 预处理（Pre-bake）阶段：将乐谱信息转换为按键事件时间轴，包含每个按键的下压和抬起时间点
+    function prebakeTimeline(bar_list, gap) {
         const keyState = {};
         // 最小间隔时间 25ms
         const MIN_GAP_TIME = 25;
@@ -425,8 +566,18 @@
             mergedTimeline.push({ time: ev.time, action: ev.action, keys: [ev.key] });
         }
 
-        log.info(`总计 ${bar_list.length} 小节，解析完成：聚合为 ${mergedTimeline.length} 批次按键动作。预计总演奏时长 ${((totalCalculatedTime + gap * 8) / 1000).toFixed(2)} 秒`);
+        return { mergedTimeline, totalCalculatedTime };
+    }
 
+    /**
+     * 运行时扫描播放器
+     */
+    async function playCachedTimeline(music_info, mergedTimeline, totalCalculatedTime, gap) {
+        log.info(`[${music_info.name}] 预计总演奏时长 ${((totalCalculatedTime + gap * 8) / 1000).toFixed(2)} 秒. 批次指令: ${mergedTimeline.length}`);
+
+        // 后台消息接口，负责将预处理好的按键事件发送给游戏，使得游戏演奏时不必总是保持在前台
+        const postMessage = new PostMessage();
+        const getNow = () => typeof performance !== 'undefined' ? performance.now() : Date.now();
 
         // 3. 启动 运行时 时间轴扫描 播放器
         log.info(`开始演奏...`);
@@ -455,89 +606,6 @@
         }
     }
 
-    /**
-     * 将乐谱键位字符串序列化为按小节分组的基本单位数组
-     * 
-     * @param {string} stringSheet - 待序列化的键位乐谱字符串
-     * @returns {Array<Array<number|Object>>} - 小节数组，每个小节为数组结构(首元素为总拍数，后接基本单位对象)：
-     *   - { kind: "rest"|"single"|"chord"|"arpeggio", keys: string[], time: number }
-     */
-    function keySheetSerialization(stringSheet) {
-        const result = [];
-        const toValidKeys = (text) => {
-            const letters = text.match(/[a-z]/gi);
-            return letters ? letters.map(ch => ch.toUpperCase()) : [];
-        };
-
-        // 处理换行符
-        stringSheet = stringSheet.replace(/\r/g, "");
-        // 处理相邻的 / 和 \n，不生成休止符
-        stringSheet = stringSheet.replace(/\/\n/g, "\n").replace(/\n\//g, "\n");
-        // 空行特例：连续换行不产生休止符
-        stringSheet = stringSheet.replace(/\n{2,}/g, "\n");
-
-        // 单行之中的按键视作一小节
-        const lines = stringSheet.split('\n');
-
-        for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-            let line = lines[lineIdx];
-            if (line.trim().length === 0) continue; // 忽略空行，不产生休止符
-
-            // 两个“/”符号之间的按键是一拍
-            const beats = line.split('/');
-            const barLength = beats.length;
-            const bar = [barLength]; // 第一项为小节里的总拍数
-
-            for (let beatIdx = 0; beatIdx < beats.length; beatIdx++) {
-                const beatStr = beats[beatIdx];
-
-                // 谱序列通过“空格”和“/”进行划分。
-                // 排除位于“/”号前的空字串，将剩余的空字串视作“休止符”（休止符）
-                let processedBeatStr = beatStr.replace(/ +$/, '');
-                let units = processedBeatStr.split(' ');
-                units = units.map(u => u === "" ? "@" : u);
-
-                const unitDuration = 1 / units.length;
-
-                for (let unitIdx = 0; unitIdx < units.length; unitIdx++) {
-                    const unitStr = units[unitIdx];
-
-                    if (unitStr === "@") {
-                        bar.push({ kind: "rest", keys: [], time: unitDuration });
-                        continue; // 休止符
-                    }
-
-                    // 使用正则提取基本单位内的原子（单词块(XXX)或单个字母X）
-                    const parts = unitStr.match(/\([A-Za-z]+\)|[A-Za-z]/g);
-                    if (!parts || parts.length === 0) {
-                        bar.push({ kind: "rest", keys: [], time: unitDuration });
-                        continue;
-                    }
-
-                    if (parts.length === 1) {
-                        const part = parts[0];
-                        const keys = toValidKeys(part);
-                        if (part.startsWith('(')) {
-                            // 同时按下 (XYZ)
-                            bar.push({ kind: "chord", keys: keys, time: unitDuration });
-                        } else {
-                            // 单个按键
-                            bar.push({ kind: "single", keys: keys, time: unitDuration });
-                        }
-                    } else {
-                        // 连续按键，可能包含混合的单音或和弦
-                        const arpeggioKeys = parts.map(part => toValidKeys(part));
-                        bar.push({ kind: "arpeggio", keys: arpeggioKeys, time: unitDuration });
-                    }
-                }
-            }
-            if (bar.length > 1 || barLength > 0) result.push(bar);
-        }
-
-        return result;
-    }
-
-
     async function waitTargetTime(targetTimeStamp) {
         if (!Number.isFinite(targetTimeStamp) || targetTimeStamp <= 0) return;
         let now = new Date();
@@ -557,10 +625,9 @@
      *
      * @returns {boolean} 如果一致返回 true，否则返回 false。
      */
-    function checkSheetFile() {
+    function checkSheetFile(localMusicList) {
         try {
-            // 1. 读取本地所有JSON曲谱文件
-            const localMusicList = musicList();
+            // 1. 读取本地所有JSON曲谱文件 (此处直接复用了传入的列表，减少磁盘I/O)
 
             // 2. 读取JS脚本配置中的曲谱列表
             const settings = JSON.parse(file.readTextSync("settings.json"));
@@ -602,20 +669,73 @@
      * ------- 主程序 --------
      */
     async function main() {
-        if (!checkSheetFile()) return;
+        const allMusicList = musicList();
+        checkAndCleanCache(allMusicList);
+        if (!checkSheetFile(allMusicList)) return;
 
-        let settings_msg = get_settings();
+        let settings_msg = get_settings(allMusicList);
         DEBUG = settings_msg.debug;
 
         const music_infos = [];
         for (const music_name of settings_msg.musicQueue) {
-            const music_info = getMusicInfo(music_name);
-            if (music_info === null) {
-                log.error(`乐曲 ${music_name} 信息有误，已跳过`);
-                continue;
+            let music_info = null;
+
+            // 优先尝试读取缓存
+            const cacheFile = `${cache_path}${music_name}.json`;
+            try {
+                const cacheText = file.readTextSync(cacheFile);
+                if (cacheText) {
+                    music_info = JSON.parse(cacheText);
+                    log.debug(`命中缓存: ${music_name}`);
+                }
+            } catch (e) { }
+
+            // 无缓存，解析曲谱并重新生成缓存
+            if (!music_info) {
+                music_info = getMusicInfo(music_name);
+                if (music_info === null) {
+                    log.error(`乐曲 ${music_name} 信息有误，已跳过`);
+                    continue;
+                }
+
+                // 预处理：首先根据BPM和拍号计算每拍时长，然后生成按键事件时间轴
+                let gapMultiplier = 1;
+                if (music_info.time_signature && music_info.time_signature.includes('/')) {
+                    const [numStr, denStr] = music_info.time_signature.split('/');
+                    const den = parseInt(denStr) || 4;
+                    const num = parseInt(numStr) || 4;
+
+                    if (den === 8 && num % 3 === 0) gapMultiplier = 1.5;
+                    else gapMultiplier = 4 / den;
+                }
+                const gap = (60000 / music_info.bpm) * gapMultiplier;
+                const { mergedTimeline, totalCalculatedTime } = prebakeTimeline(music_info.notes, gap);
+
+                // 构造缓存对象
+                const cacheData = {
+                    name: music_info.name,
+                    author: music_info.author,
+                    barCount: music_info.notes.length,
+                    eventBatchCount: mergedTimeline.length,
+                    expectedDuration: totalCalculatedTime,
+                    create_time: new Date().getTime(),
+                    gap: gap,
+                    mergedTimeline: mergedTimeline
+                };
+
+                try {
+                    file.writeTextSync(cacheFile, JSON.stringify(cacheData));
+                    log.info(`已生成缓存: ${music_name}`);
+                } catch (e) {
+                    log.warn(`生成缓存失败: ${music_name}`);
+                }
+
+                music_info = cacheData;
             }
+
             music_infos.push(music_info);
         }
+
         if (music_infos.length === 0) {
             log.error("无可演奏曲目，脚本结束");
             return;
@@ -632,30 +752,8 @@
             for (let i = 0; i < music_infos.length; i++) {
                 const music_info = music_infos[i];
                 log.info(`准备演奏: ${music_info.name} - ${music_info.author}`);
-                if (DEBUG) {
-                    log.info(`乐曲已打印至${music_info.name}.json`);
-                    let info = [];
-                    music_info.notes.forEach((note, index) => {
-                        info.push([index, ...note]);
-                    });
-                    file.writeTextSync(`${music_info.name}.json`, `${JSON.stringify(info)}`);
-                }
-                // 计算每拍时长，默认以四分音符为基准。当遇到非四分音符基底的拍号时，自动进行修正以防止速度异常。
-                let gapMultiplier = 1;
-                if (music_info.time_signature && music_info.time_signature.includes('/')) {
-                    const [numStr, denStr] = music_info.time_signature.split('/');
-                    const num = parseInt(numStr) || 4;
-                    const den = parseInt(denStr) || 4;
 
-                    if (den === 8 && num % 3 === 0) {
-                        // 对于 6/8, 9/8 等复合拍子，通常以附点四分音符为一拍（即1.5个四分音符）
-                        gapMultiplier = 1.5;
-                    } else {
-                        // 其他情况按占四分音符的比例
-                        gapMultiplier = 4 / den;
-                    }
-                }
-                await listNotePlay(music_info.notes, (60000 / music_info.bpm) * gapMultiplier);
+                await playCachedTimeline(music_info, music_info.mergedTimeline, music_info.expectedDuration, music_info.gap);
 
                 if (isQueueMode && settings_msg.queueInterval > 0 && i < music_infos.length - 1) {
                     await sleep(settings_msg.queueInterval * 1000);
