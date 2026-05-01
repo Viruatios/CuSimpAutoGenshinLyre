@@ -76,16 +76,11 @@
                         return;
                     }
 
-                    const cacheText = file.readTextSync(entry);
-                    if (!cacheText) {
-                        deleteFile(entry);
-                        return;
-                    }
-                    const cacheData = JSON.parse(cacheText);
                     const modTime = getFileModTime(scoreFile);
+                    const cacheModTime = getFileModTime(entry);
 
-                    // 创建时间早于曲谱修改时间，或无创建时间，则删除
-                    if (!cacheData.create_time || (modTime > 0 && cacheData.create_time < modTime)) {
+                    // 缓存修改时间早于曲谱修改时间，则删除
+                    if (modTime > 0 && cacheModTime < modTime) {
                         deleteFile(entry);
                         log.debug(`曲谱已修改，已删除过期缓存: ${fileName}`);
                     }
@@ -580,15 +575,18 @@
         const getNow = () => typeof performance !== 'undefined' ? performance.now() : Date.now();
 
         // 3. 启动 运行时 时间轴扫描 播放器
-        log.info(`开始演奏...`);
-
         const playStartTime = getNow();
 
         for (const ev of mergedTimeline) {
             const targetTime = playStartTime + ev.time;
             const remain = targetTime - getNow();
-            if (remain > 0) {
-                await sleep(remain);
+
+            if (remain > 15) {
+                // 在剩余时间充裕时使用 sleep 进行阻塞等待，减少CPU占用
+                await sleep(remain - 15);
+            }
+            while (getNow() < targetTime) {
+                // 冲刺阶段，使用高精度自旋对齐，取消阻塞
             }
 
             // 执行聚合后的按键组指令
@@ -678,62 +676,7 @@
 
         const music_infos = [];
         for (const music_name of settings_msg.musicQueue) {
-            let music_info = null;
-
-            // 优先尝试读取缓存
-            const cacheFile = `${cache_path}${music_name}.json`;
-            try {
-                const cacheText = file.readTextSync(cacheFile);
-                if (cacheText) {
-                    music_info = JSON.parse(cacheText);
-                    log.debug(`命中缓存: ${music_name}`);
-                }
-            } catch (e) { }
-
-            // 无缓存，解析曲谱并重新生成缓存
-            if (!music_info) {
-                music_info = getMusicInfo(music_name);
-                if (music_info === null) {
-                    log.error(`乐曲 ${music_name} 信息有误，已跳过`);
-                    continue;
-                }
-
-                // 预处理：首先根据BPM和拍号计算每拍时长，然后生成按键事件时间轴
-                let gapMultiplier = 1;
-                if (music_info.time_signature && music_info.time_signature.includes('/')) {
-                    const [numStr, denStr] = music_info.time_signature.split('/');
-                    const den = parseInt(denStr) || 4;
-                    const num = parseInt(numStr) || 4;
-
-                    if (den === 8 && num % 3 === 0) gapMultiplier = 1.5;
-                    else gapMultiplier = 4 / den;
-                }
-                const gap = (60000 / music_info.bpm) * gapMultiplier;
-                const { mergedTimeline, totalCalculatedTime } = prebakeTimeline(music_info.notes, gap);
-
-                // 构造缓存对象
-                const cacheData = {
-                    name: music_info.name,
-                    author: music_info.author,
-                    barCount: music_info.notes.length,
-                    eventBatchCount: mergedTimeline.length,
-                    expectedDuration: totalCalculatedTime,
-                    create_time: new Date().getTime(),
-                    gap: gap,
-                    mergedTimeline: mergedTimeline
-                };
-
-                try {
-                    file.writeTextSync(cacheFile, JSON.stringify(cacheData));
-                    log.info(`已生成缓存: ${music_name}`);
-                } catch (e) {
-                    log.warn(`生成缓存失败: ${music_name}`);
-                }
-
-                music_info = cacheData;
-            }
-
-            music_infos.push(music_info);
+            music_infos.push({ music_name });
         }
 
         if (music_infos.length === 0) {
@@ -750,10 +693,71 @@
         // try {
         do {
             for (let i = 0; i < music_infos.length; i++) {
-                const music_info = music_infos[i];
+                const base_info = music_infos[i];
+                const music_name = base_info.music_name;
+                let music_info = null;
+
+                // 优先尝试读取缓存
+                const cacheFile = `${cache_path}${music_name}.json`;
+                try {
+                    const cacheText = file.readTextSync(cacheFile);
+                    if (cacheText) {
+                        // Lazy Load：仅在演奏这首时加载它的缓存，避免一次性加载过多曲目导致内存占用过高
+                        music_info = JSON.parse(cacheText);
+                        log.debug(`命中缓存: ${music_name}`);
+                    }
+                } catch (e) { }
+
+                // 无缓存，解析曲谱并重新生成缓存
+                if (!music_info) {
+                    music_info = getMusicInfo(music_name);
+                    if (music_info === null) {
+                        log.error(`乐曲 ${music_name} 信息有误，已跳过`);
+                        continue;
+                    }
+
+                    // 预处理：首先根据BPM和拍号计算每拍时长，然后生成按键事件时间轴
+                    let gapMultiplier = 1;
+                    if (music_info.time_signature && music_info.time_signature.includes('/')) {
+                        const [numStr, denStr] = music_info.time_signature.split('/');
+                        const den = parseInt(denStr) || 4;
+                        const num = parseInt(numStr) || 4;
+
+                        if (den === 8 && num % 3 === 0) gapMultiplier = 1.5;
+                        else gapMultiplier = 4 / den;
+                    }
+                    const gap = (60000 / music_info.bpm) * gapMultiplier;
+                    const { mergedTimeline, totalCalculatedTime } = prebakeTimeline(music_info.notes, gap);
+
+                    // 构造缓存对象
+                    const cacheData = {
+                        name: music_info.name,
+                        author: music_info.author,
+                        barCount: music_info.notes.length,
+                        eventBatchCount: mergedTimeline.length,
+                        expectedDuration: totalCalculatedTime,
+                        create_time: new Date().getTime(),
+                        gap: gap,
+                        mergedTimeline: mergedTimeline
+                    };
+
+                    try {
+                        file.writeTextSync(cacheFile, JSON.stringify(cacheData));
+                        log.info(`已生成缓存: ${music_name}`);
+                    } catch (e) {
+                        log.warn(`生成缓存失败: ${music_name}`);
+                    }
+
+                    music_info = cacheData;
+                }
+
                 log.info(`准备演奏: ${music_info.name} - ${music_info.author}`);
 
                 await playCachedTimeline(music_info, music_info.mergedTimeline, music_info.expectedDuration, music_info.gap);
+
+                // Lazy Load：播放完成后立刻显式内存回收
+                music_info.mergedTimeline = null;
+                music_info = null;
 
                 if (isQueueMode && settings_msg.queueInterval > 0 && i < music_infos.length - 1) {
                     await sleep(settings_msg.queueInterval * 1000);

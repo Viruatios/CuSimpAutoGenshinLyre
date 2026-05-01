@@ -217,7 +217,15 @@
 - 引入预处理时间轴保存为缓存文件的机制，资源路径更新：新增了常数 cache_path 指向 cache 文件夹。
 - 预处理逻辑解耦，运行时播放器重构：将原来紧耦合在 listNotePlay 函数中的时间轴编译过程抽取为独立的 prebakeTimeline 计算函数；将剩余部分提炼为纯粹只负责通过延时播放解析完毕数组流的 playCachedTimeline 运行时函数。
 - 缓存文件生成机制：对于没有缓存的曲目，代码会在通过 prebakeTimeline 获取 mergedTimeline 和 totalCalculatedTime 等信息后，构造一个包含曲目详细描述、小节数、批次指令数目、总时长、 create_time 和乐曲的单拍时长 gap 的对象，并转化为 JSON，根据曲名保存在缓存路径中。后续再遇该曲可以直接快速加载。
-- 缓存的过期判断和清理机制：新增了 checkAndCleanCache、getFileModTime 等工具函数，在 main 程序入口启动时首先调用。若缓存对应的曲谱丢失，或者曲谱通过内置系统函数 System.IO.File 获取到的修改时间比缓存的保存时间更新，则认为这部分缓存数据已过期，自动清理。
+- 缓存的过期判断和清理机制：新增了 checkAndCleanCache、getFileModTime 等工具函数，在 main 程序入口启动时首先调用。若缓存对应的曲谱丢失，或者通过 System.IO.File 获取到的曲谱修改时间比缓存的修改时间更新，则认为这部分缓存数据已过期，自动清理。
 - 其他：实现了高频正则操作的去重与原生替换优化，并调整了 get_settings() 和 checkSheetFile() 让它们共用同一个来自 musicList() 的文件目录数组参数，省去原来重复且昂贵的磁盘 I/O。
 
 #### v0.1.10c 修复了新代码中，键盘谱解析时跳过纯休止符拍的问题
+
+#### v0.1.10d 播放器引入混合休眠策略，引入懒加载，与其他优化
+
+- 缓存检查降级为元数据 IO（解决启动卡顿峰值）：修改了 checkAndCleanCache 函数，不再读取整个 .json 缓存文件的文本并进行 JSON.parse 昂贵的序列化操作，现在直接调用 getFileModTime(entry) 获取缓存文件的最后修改时间，和原曲谱的修改时间 modTime 进行低成本比对，若缓存修改更早就直接判定过期。
+
+- 播放器引入 Hybrid Sleep / Spin-Wait 混合休眠策略（解决计时精准度）：在 playCachedTimeline 核心调度循环中，改用 remain > 15 的阈值判断，即当距离目标触发时间差大于 15 毫秒时才会出让 CPU 使用 await sleep(remain - 15) 休眠。剩余时间全部转入 while (getNow() < targetTime) 进行自旋式对齐。消除传统 sleep() 带来的 JavaScript 定时器系统导致的数毫秒误差与积压延迟。
+
+- 在播放循环引入懒加载(Lazy Load)，重构生命周期（解决内存 OOM 溢出风险）：脚本启动时 music_infos 数组现在只填充诸如 { music_name: "0001.xxx" } 此类基础轻量对象，不会预加载庞大的乐谱。读取缓存或执行 prebakeTimeline 计算均推迟到 do ... while 内真正轮到该歌曲时执行。当单曲执行完毕后，执行显式内存回收：music_info.mergedTimeline = null; music_info = null;。这样每次一首歌弹完，庞大的打点时间轴数组引用会立刻被垃圾回收，使得内存能够保持稳定。
