@@ -581,9 +581,9 @@
             const targetTime = playStartTime + ev.time;
             const remain = targetTime - getNow();
 
-            if (remain > 15) {
+            if (remain > 5) {
                 // 在剩余时间充裕时使用 sleep 进行阻塞等待，减少CPU占用
-                await sleep(remain - 15);
+                await sleep(remain - 5);
             }
             while (getNow() < targetTime) {
                 // 冲刺阶段，使用高精度自旋对齐，取消阻塞
