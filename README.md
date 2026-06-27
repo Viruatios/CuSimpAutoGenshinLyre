@@ -1,6 +1,6 @@
 # 简化自动原琴 - CuSimpAutoGenshinLyre
 
-一个BetterGI的JS自动化脚本，从提瓦特钓鱼玳师和半江残秋老师的AutoYuanQin简化修改而来。
+一个BetterGI的JS自动化脚本，最初开发时从提瓦特钓鱼玳师和半江残秋老师的AutoYuanQin简化修改而来，随着功能需求的增加和演奏规则的完善逐渐独立发展为 CuSimpAutoGenshinLyre。
 
 ## 播放演奏脚本
 
